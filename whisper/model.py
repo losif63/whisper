@@ -13,6 +13,29 @@ from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
 
 
+import threading
+import os
+
+
+# custom function for saving pytorch tensor
+
+def save_tensor_async(filename: str, tensor: torch.Tensor):
+    def save_task():
+        torch.save(tensor, filename)
+        print(f"Tensor saved to {filename}")
+
+    thread = threading.Thread(target=save_task)
+    thread.start()
+    return thread
+
+# Example usage:
+# tensor = torch.randn(100, 100)
+# thread = save_tensor_async("my_tensor.pt", tensor)
+# 
+# If you need to wait for the save to complete:
+# thread.join()
+
+
 @dataclass
 class ModelDimensions:
     n_mels: int
@@ -129,13 +152,42 @@ class ResidualAttentionBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
+        indicator: str,
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
     ):
-        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+        
         if self.cross_attn:
-            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
+            attn_result = self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
+            weighted_v, raw_attn_score = attn_result[0], attn_result[1]
+            x = x + weighted_v
+            
+            cross_attn_result = self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)
+            cross_weigthed_v, raw_cross_attn_score = cross_attn_result[0], cross_attn_result[1]
+            x = x + cross_weigthed_v
+            
+            colnum = raw_attn_score.shape[-1]
+            if not os.path.isdir("data/attention/" + indicator + "/"):
+                os.mkdir("data/attention/" + indicator + "/")
+                os.mkdir("data/attention/" + indicator + "/attn/")
+                os.mkdir("data/attention/" + indicator + "/cross_attn/")
+            
+            attn_score = F.softmax(raw_attn_score, dim=-1).to(raw_attn_score.dtype)
+            save_tensor_async("data/attention/" + indicator  + "/attn/" + f"col{colnum}.pt", attn_score)
+            
+            cross_attn_score = F.softmax(raw_cross_attn_score, dim=-1).to(raw_attn_score.dtype)
+            save_tensor_async("data/attention/" + indicator + "/cross_attn/" + f"col{colnum}.pt", cross_attn_score)
+        
+        else:
+            attn_result = self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
+            weighted_v, raw_attn_score = attn_result[0], attn_result[1]
+            x = x + weighted_v
+            
+        
+            attn_score = F.softmax(raw_attn_score, dim=-1).to(raw_attn_score.dtype)
+            save_tensor_async("data/attention/" + indicator + "_attn.pt", attn_score)
+        
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
@@ -166,8 +218,10 @@ class AudioEncoder(nn.Module):
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding).to(x.dtype)
 
+        index = 0
         for block in self.blocks:
-            x = block(x)
+            x = block(x, f"encoder{index}")
+            index += 1
 
         x = self.ln_post(x)
         return x
@@ -200,6 +254,7 @@ class TextDecoder(nn.Module):
         xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
             the encoded audio features to be attended on
         """
+        
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (
             self.token_embedding(x)
@@ -207,8 +262,10 @@ class TextDecoder(nn.Module):
         )
         x = x.to(xa.dtype)
 
+        index = 0
         for block in self.blocks:
-            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+            x = block(x, f"decoder{index}", xa, mask=self.mask, kv_cache=kv_cache)
+            index += 1
 
         x = self.ln(x)
         logits = (
